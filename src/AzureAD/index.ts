@@ -10,17 +10,81 @@
 |
 */
 
-import type { AllyUserContract, ApiRequestContract } from '@ioc:Adonis/Addons/Ally'
-import type { HttpContextContract } from '@ioc:Adonis/Core/HttpContext'
 import type {
-  AADAccessToken,
-  AADConfig,
-  AADScopes,
-  UserFields,
-  UserFieldsAndToken,
-  UserInfo,
-} from '../types'
+  AllyUserContract,
+  ApiRequestContract,
+  LiteralStringUnion,
+} from '@ioc:Adonis/Addons/Ally'
+import type { HttpContextContract } from '@ioc:Adonis/Core/HttpContext'
 import { Oauth2Driver, ApiRequest, RedirectRequest } from '@adonisjs/ally/build/standalone'
+import AllyUser, { UserFields } from '../helpers/AllyUser'
+import _ from 'lodash'
+
+/**
+ * Define the access token object properties in this type. It
+ * must have "token" and "type" and you are free to add
+ * more properties.
+ *
+ * ------------------------------------------------
+ * Change "AAD" to something more relevant
+ * ------------------------------------------------
+ */
+export type AADAccessToken = {
+  token: string
+  type: string
+  token_type: string
+  scope: string
+  expires_in: number
+  ext_expires_in: number
+  access_token: string
+  refresh_token: string
+  id_token: string
+}
+
+/**
+ * Define a union of scopes your driver accepts. Here's an example of same
+ * https://github.com/adonisjs/ally/blob/develop/adonis-typings/ally.ts#L236-L268
+ *
+ * ------------------------------------------------
+ * Change "AAD" to something more relevant
+ * ------------------------------------------------
+ */
+export type AADScopes = string
+
+/**
+ * Define the configuration options accepted by your driver. It must have the following
+ * properties and you are free add more.
+ *
+ * ------------------------------------------------
+ * Change "AAD" to something more relevant
+ * ------------------------------------------------
+ */
+export type AADConfig = {
+  driver: 'AzureAD'
+  clientId: string
+  clientSecret: string
+  callbackUrl: string
+  authorizeUrl?: string
+  accessTokenUrl?: string
+  userInfoUrl?: string
+  scopes?: LiteralStringUnion<AADScopes>[]
+}
+
+export type UserInfo = {
+  '@odata.context': string
+  '@odata.id': string
+  'businessPhones': string[]
+  'displayName': string
+  'givenName': string
+  'jobTitle': string
+  'mail': string
+  'mobilePhone': string
+  'officeLocation': string
+  'preferredLanguage'?: any
+  'surname': string
+  'userPrincipalName': string
+  'id': string
+}
 
 /**
  * Driver implementation. It is mostly configuration driven except the user calls
@@ -41,14 +105,14 @@ export class AAD extends Oauth2Driver<AADAccessToken, AADScopes> {
    *
    * Do not define query strings in this URL.
    */
-  protected authorizeUrl = 'https://login.microsoftonline.com/common/oauth2/v2.0/authorize'
+  protected authorizeUrl = 'https://graph.microsoft.com/v1.0'
 
   /**
    * The URL to hit to exchange the authorization code for the access token
    *
    * Do not define query strings in this URL.
    */
-  protected accessTokenUrl = 'https://login.microsoftonline.com/common/oauth2/v2.0/token'
+  protected accessTokenUrl = 'https://graph.microsoft.com/v1.0'
 
   /**
    * The URL to hit to get the user details
@@ -62,7 +126,7 @@ export class AAD extends Oauth2Driver<AADAccessToken, AADScopes> {
    * provider and update the param name to match the query string field name in
    * which the oauth provider sends the authorization_code post redirect.
    */
-  protected codeParamName = 'code'
+  protected codeParamName = 'accessToken'
 
   /**
    * The param name for the error. Read the documentation of your oauth provider and update
@@ -108,22 +172,19 @@ export class AAD extends Oauth2Driver<AADAccessToken, AADScopes> {
      * DO NOT REMOVE THE FOLLOWING LINE
      */
     this.loadState()
-
-    // Perform stateless authentication. Only applicable for Oauth2 client
-    this.stateless()
   }
 
   /**
    * Configuring the redirect request with defaults
    */
-  protected configureRedirectRequest(request: RedirectRequest<AADScopes>): void {
+  protected configureRedirectRequest(request: RedirectRequest<AADScopes>) {
     /**
      * Define user defined scopes or the default one's
      */
     request.scopes(this.config.scopes || ['openid', 'profile', 'email', 'offline_access'])
 
     request.param('client_id', this.config.clientId)
-    request.param('response_type', 'code')
+    request.param('response_type', 'id_token')
     request.param('response_mode', 'query')
   }
 
@@ -131,19 +192,43 @@ export class AAD extends Oauth2Driver<AADAccessToken, AADScopes> {
    * Update the implementation to tell if the error received during redirect
    * means "ACCESS DENIED".
    */
-  public accessDenied(): boolean {
+  public accessDenied() {
     return this.ctx.request.input('error') === 'invalid_grant'
   }
 
   /**
    * Returns the HTTP request with the authorization header set
    */
-  protected getAuthenticatedRequest(url: string, token: string): ApiRequest {
+  protected getAuthenticatedRequest(url: string, token: string) {
     const request = this.httpClient(url)
     request.header('Authorization', `Bearer ${token}`)
     request.header('Accept', 'application/json')
     request.parseAs('json')
     return request
+  }
+
+  private buildAllyUser(userProfile, accessTokenResponse) {
+    const allyUserBuilder = new AllyUser()
+    const expires = _.get(accessTokenResponse, 'expires')
+    const name = userProfile.givenName || userProfile.displayName
+    const emailVerificationState = _.get(userProfile, 'emailVerificationState', 'unverified')
+
+    allyUserBuilder
+      .setOriginal(userProfile)
+      .setFields(
+        userProfile.id,
+        name,
+        userProfile.surname,
+        userProfile.userPrincipalName,
+        null,
+        emailVerificationState
+      )
+      .setToken(accessTokenResponse.accessToken, null, null, expires ? Number(expires) : null)
+      .toJSON()
+
+    const user: UserFields = allyUserBuilder.toJSON()
+
+    return user
   }
 
   /**
@@ -158,22 +243,20 @@ export class AAD extends Oauth2Driver<AADAccessToken, AADScopes> {
       this.config.userInfoUrl || this.userInfoUrl,
       token
     )
+
+    const accessTokenResponse = {
+      accessToken: token,
+    }
+
     if (typeof callback === 'function') {
       callback(userRequest)
     }
 
     const userBody: UserInfo = await userRequest.get()
 
-    return {
-      id: userBody.id,
-      nickName: userBody.id,
-      displayName: userBody.displayName,
-      avatarUrl: null,
-      name: `${userBody.givenName}${userBody.surname ? ` ${userBody.surname}` : ''}`,
-      email: userBody.mail ? (userBody.mail as string) : (null as null),
-      emailVerificationState: 'unsupported' as const,
-      original: userBody,
-    }
+    this.validateUserProfile(userBody)
+
+    return this.buildAllyUser(userBody, accessTokenResponse)
   }
 
   /**
@@ -187,8 +270,20 @@ export class AAD extends Oauth2Driver<AADAccessToken, AADScopes> {
     if (client.responseType === 'json') {
       return response
     }
+  }
 
-    // return parse(client.responseType === 'buffer' ? response.toString() : response)
+  // Not every MS account has email
+  protected validateUserProfile(userProfile) {
+    const email = userProfile.userPrincipalName
+    const re =
+      /^(([^<>()[\]\\.,;:\s@\"]+(\.[^<>()[\]\\.,;:\s@\"]+)*)|(\".+\"))@((\[[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\])|(([a-zA-Z\-0-9]+\.)+[a-zA-Z]{2,}))$/
+    const errorMessage =
+      'Unfortunately, we support logins via email only. Please enter your email and try again.'
+    if (!re.test(email)) throw new Error(errorMessage)
+  }
+
+  public getCode(): string | null {
+    return this.ctx.request.input(this.codeParamName, null)
   }
 
   /**
@@ -201,19 +296,21 @@ export class AAD extends Oauth2Driver<AADAccessToken, AADScopes> {
   public async user(
     callback?: (request: ApiRequest) => void
   ): Promise<AllyUserContract<AADAccessToken>> {
-    const accessToken = await this.accessToken()
+    const accessToken = this.getCode()
 
+    if (!accessToken) throw new Error('No access token found')
     /**
      * Allow end user to configure the request. This should be called after your custom
      * configuration, so that the user can override them (if required)
      */
-    const user: UserFields = await this.getUserInfo(accessToken.token, callback)
+    const user = await this.getUserInfo(accessToken, callback)
 
     /**
      * Write your implementation details here
      */
     return {
       ...user,
+      // @ts-ignore
       token: accessToken,
     }
   }
@@ -221,7 +318,7 @@ export class AAD extends Oauth2Driver<AADAccessToken, AADScopes> {
   /**
    * Finds the user by the access token
    */
-  public async userFromToken(token: string): Promise<UserFieldsAndToken> {
+  public async userFromToken(token: string) {
     const user: UserFields = await this.getUserInfo(token)
 
     return {
